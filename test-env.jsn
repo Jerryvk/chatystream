@@ -1,0 +1,6 @@
+import dotenv from "dotenv";
+dotenv.config({ path: "./environments/.env" });
+
+console.log("✅ OPENAI key start:", process.env.OPENAI_API_KEY?.slice(0, 15));
+console.log("✅ Twilio SID:", process.env.TWILIO_ACCOUNT_SID);
+console.log("✅ Base URL:", process.env.BASE_URL);
