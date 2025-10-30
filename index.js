@@ -19,8 +19,15 @@ function logEvent(event, detail = {}) {
 const server = http.createServer((req, res) => {
   // TwiML endpoint: respond with XML to instruct Twilio to start Media Stream
   if (req.url === '/twiml') {
-    logEvent('twiml.request', { path: '/twiml' });
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Start>\n    <Stream name="chaty"\n            url="wss://chatystream.chat/stream-gateway" />\n  </Start>\n  <Say>Streaming started.</Say>\n</Response>`;
+    logEvent('twiml.request', { path: '/twiml', method: req.method });
+    // Twilio posts to this endpoint; require POST for TwiML generation
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'text/plain' });
+      res.end('Method Not Allowed. POST required.');
+      return;
+    }
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Play>https://chatystream.chat/Greetings%20generic.mp3</Play>\n  <Pause length="2"/>\n  <Connect>\n    <Stream url="wss://chatystream.chat/stream-gateway" track="inbound_track"/>\n  </Connect>\n</Response>`;
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(twiml);
     return;

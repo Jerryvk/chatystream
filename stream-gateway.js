@@ -1,4 +1,3 @@
-pm2 logs chatty
 import express from "express";
 import expressWs from "express-ws";
 import WebSocket from "ws";
@@ -211,88 +210,88 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
     }
 
     // If Twilio Media Stream JSON
-    if (parsed && parsed.event && (parsed.event === 'start' || parsed.event === 'media' || parsed.event === 'stop')) {
-      // Twilio flow: start, media, stop
+    if (parsed && parsed.event) {
+      // Diagnostic: log every incoming Twilio event with timestamp and basic payload info
+      try {
+        const ev = parsed.event;
+        // For start, show which keys arrived (useful to see streamSid/accountSid)
+        if (ev === 'start') {
+          const keys = Object.keys(parsed || {});
+          console.log(`[${nowTs()}] event:start keys=${JSON.stringify(keys)}`);
+        } else if (ev === 'media') {
+          const payloadB64 = parsed.media && parsed.media.payload;
+          if (payloadB64) {
+            // compute decoded byte length without altering later flow
+            const decodedLen = Buffer.from(payloadB64, 'base64').length;
+            console.log(`[${nowTs()}] event:media payload=${decodedLen} bytes`);
+          } else {
+            console.log(`[${nowTs()}] event:media payload=0 bytes`);
+          }
+        } else if (ev === 'stop') {
+          console.log(`[${nowTs()}] event:stop`);
+        } else if (ev === 'mark') {
+          console.log(`[${nowTs()}] event:mark keys=${JSON.stringify(Object.keys(parsed || {}))}`);
+        } else {
+          console.log(`[${nowTs()}] event:${String(ev)} keys=${JSON.stringify(Object.keys(parsed || {}))}`);
+        }
+      } catch (e) {
+        // non-fatal diagnostic failure
+        logEvent('twilio.diagnostic.error', { message: String(e && e.message ? e.message : e) }, connId);
+      }
+
+      // Twilio flow: start, media, stop, mark
       if (parsed.event === 'start') {
         logEvent('twilio.start', { sid: parsed.streamSid || parsed.session }, connId);
-        // initialize per-connection audio state
-        clientWs._twilio = clientWs._twilio || { audioChunks: [], audioBytes: 0, lastFlush: Date.now() };
+        // human-friendly log for checklist
+        console.log(`[${nowTs()}] Twilio connected`);
+        // initialize per-connection audio state (kept minimal for future steps)
+        clientWs._twilio = clientWs._twilio || { seen: true };
       } else if (parsed.event === 'media') {
         // payload is base64 in parsed.media.payload
         const payloadB64 = parsed.media && parsed.media.payload;
         if (payloadB64) {
           try {
+            // Decode base64 first
             const raw = Buffer.from(payloadB64, 'base64');
-            // decode mu-law to PCM16LE
-            const pcm16 = decodeMuLawBuffer(raw);
-            clientWs._twilio = clientWs._twilio || { audioChunks: [], audioBytes: 0, lastFlush: Date.now() };
-            clientWs._twilio.audioChunks.push(pcm16);
-            clientWs._twilio.audioBytes += pcm16.length;
-            logEvent('twilio.media', { bytes: raw.length, pcmBytes: pcm16.length }, connId);
 
-            // If threshold reached, flush to Whisper async
-            const shouldFlush = clientWs._twilio.audioBytes >= 40 * 1024 || (Date.now() - clientWs._twilio.lastFlush) >= 5000;
-            if (shouldFlush) {
-              const chunks = clientWs._twilio.audioChunks.splice(0);
-              const totalBytes = clientWs._twilio.audioBytes;
-              clientWs._twilio.audioBytes = 0;
-              clientWs._twilio.lastFlush = Date.now();
-        (async () => {
-                const concatenated = Buffer.concat(chunks);
-                // upsample from 8k->16k and provide 16k WAV to Whisper
-                const up = upsample8kTo16k(concatenated);
-                const wav = wavBufferFromPcm16LE(up, 16000);
-                logEvent('whisper.send', { bytes: concatenated.length, upsampledBytes: up.length }, connId);
-                const transcriptionResp = await transcribeBufferWithRetry(connId, wav);
-                if (transcriptionResp && transcriptionResp.text) {
-                  logEvent('whisper.transcribed', { text: transcriptionResp.text }, connId);
-                  // forward to AI socket
-                  const inputObj = { type: 'input_text', text: transcriptionResp.text };
-                  try {
-                    if (aiSocket.readyState === WebSocket.OPEN) {
-                      aiSocket.send(JSON.stringify(inputObj));
-                      logEvent('ai.message.sent', { bytes: byteLen(JSON.stringify(inputObj)), isBinary: false }, connId);
-                    } else {
-                      logEvent('ai.message.sent', { bytes: byteLen(JSON.stringify(inputObj)), buffered: true }, connId);
-                      bufferStore({ ts: Date.now(), bytes: byteLen(JSON.stringify(inputObj)), isBinary: false, payload: JSON.stringify(inputObj) });
-                    }
-                  } catch (e) {
-                    logEvent('ai.socket.error', { message: String(e && e.message ? e.message : e) }, connId);
-                  }
-                }
-              })();
+            // Twilio may send either raw PCM16LE (audio/pcm) or mu-law 8-bit samples.
+            // Prefer PCM16LE when payload length is even and looks like int16 samples.
+            let pcm16Buffer = null;
+            if (raw.length % 2 === 0) {
+              // Treat as PCM16LE
+              pcm16Buffer = raw;
+            } else {
+              // Fallback to mu-law decode for odd-length buffers
+              pcm16Buffer = decodeMuLawBuffer(raw);
             }
+
+            // Compute RMS over int16 samples
+            const sampleCount = Math.floor(pcm16Buffer.length / 2);
+            let sumSq = 0;
+            for (let i = 0; i < sampleCount; i++) {
+              const s = pcm16Buffer.readInt16LE(i * 2);
+              sumSq += s * s;
+            }
+            const meanSq = sampleCount > 0 ? (sumSq / sampleCount) : 0;
+            const rms = Math.sqrt(meanSq) / 32768; // normalize to [0,1]
+
+            // Log in a human-friendly single-line format for easy grepping during tests
+            console.log(`[${nowTs()}] frames: ${pcm16Buffer.length} bytes, rms: ${rms.toFixed(4)}`);
+
+            // Also emit structured event for diagnostics
+            logEvent('twilio.media', { bytes: raw.length, pcmBytes: pcm16Buffer.length, rms }, connId);
+
+            // NOTE: Do not forward or transcribe Twilio audio in Section 2.1. This step only verifies incoming audio.
           } catch (e) {
             logEvent('twilio.error', { message: String(e && e.message ? e.message : e) }, connId);
           }
         }
       } else if (parsed.event === 'stop') {
         logEvent('twilio.stop', { sid: parsed.streamSid }, connId);
-        // flush remaining audio
-        if (clientWs._twilio && clientWs._twilio.audioChunks && clientWs._twilio.audioChunks.length > 0) {
-          const chunks = clientWs._twilio.audioChunks.splice(0);
-          clientWs._twilio.audioBytes = 0;
-      (async () => {
-        const concatenated = Buffer.concat(chunks);
-        // upsample from 8k->16k and provide 16k WAV to Whisper
-        const up = upsample8kTo16k(concatenated);
-        const wav = wavBufferFromPcm16LE(up, 16000);
-        logEvent('whisper.send', { bytes: concatenated.length, upsampledBytes: up.length }, connId);
-        const transcriptionResp = await transcribeBufferWithRetry(connId, wav);
-            if (transcriptionResp && transcriptionResp.text) {
-              logEvent('whisper.transcribed', { text: transcriptionResp.text }, connId);
-              const inputObj = { type: 'input_text', text: transcriptionResp.text };
-              try {
-                if (aiSocket.readyState === WebSocket.OPEN) {
-                  aiSocket.send(JSON.stringify(inputObj));
-                  logEvent('ai.message.sent', { bytes: byteLen(JSON.stringify(inputObj)), isBinary: false }, connId);
-                }
-              } catch (e) {
-                logEvent('ai.socket.error', { message: String(e && e.message ? e.message : e) }, connId);
-              }
-            }
-          })();
-        }
+        // human-friendly log for checklist
+        console.log(`[${nowTs()}] Stream ended`);
+        // clear any minimal state we kept
+        if (clientWs._twilio) clientWs._twilio = null;
       }
       // Twilio messages are handled above; do not further forward raw JSON to AI
       return;
