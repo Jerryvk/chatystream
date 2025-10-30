@@ -1,8 +1,87 @@
 nohup: ignoring input
-[dotenv@17.2.3] injecting env (4) from environments/.env -- tip: ⚙️  override existing env vars with { override: true }
-{"ts":"2025-10-30T01:21:49.437Z","event":"gateway.start","detail":{"port":3002}}
-{"ts":"2025-10-30T01:21:49.438Z","event":"security.key.prefix","detail":{"prefix":"sk-proj-"}}
-{"ts":"2025-10-30T01:21:49.445Z","event":"gateway.start","detail":{"port":3002}}
+[dotenv@17.2.3] injecting env (4) from environments/.env -- tip: 🔐 prevent committing .env to code: https://dotenvx.com/precommit
+{"ts":"2025-10-30T02:09:58.677Z","event":"gateway.start","detail":{"port":3002}}
+{"ts":"2025-10-30T02:09:58.677Z","event":"security.key.prefix","detail":{"prefix":"sk-proj-"}}
+{"ts":"2025-10-30T02:09:58.682Z","event":"gateway.start","detail":{"port":3002}}
 Chatty Stream Gateway active on :3002
 ✅ TwiML endpoint active — Twilio can now stream live audio to the gateway.
-{"ts":"2025-10-30T01:22:10.130Z","event":"twiml.request","detail":{"path":"/twiml"}}
+{"ts":"2025-10-30T02:10:48.941Z","event":"client.connected","detail":{},"connId":1}
+{"ts":"2025-10-30T02:10:48.942Z","event":"security.key.prefix","detail":{"prefix":"sk-proj-"},"connId":1}
+{"ts":"2025-10-30T02:10:48.942Z","event":"ai.socket.connecting","detail":{"url":"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"},"connId":1}
+{"ts":"2025-10-30T02:10:48.993Z","event":"twilio.start","detail":{"sid":"SIM123","callSid":"SIM123"},"connId":1}
+📞 Twilio connected — recording mode active
+🎙️ Stream started for SIM123
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:10:48.993Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":1}
+{"ts":"2025-10-30T02:10:49.006Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":1}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:10:49.053Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":1}
+{"ts":"2025-10-30T02:10:49.055Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":1}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:10:49.154Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":1}
+{"ts":"2025-10-30T02:10:49.154Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":1}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:10:49.254Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":1}
+{"ts":"2025-10-30T02:10:49.255Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":1}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:10:49.354Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":1}
+{"ts":"2025-10-30T02:10:49.354Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":1}
+{"ts":"2025-10-30T02:10:49.455Z","event":"twilio.stop","detail":{"sid":"SIM123"},"connId":1}
+🛑 Stream ended
+{"ts":"2025-10-30T02:10:49.462Z","event":"client.closed","detail":{"code":1005,"reason":""},"connId":1}
+{"ts":"2025-10-30T02:10:49.463Z","event":"ai.socket.error","detail":{"message":"WebSocket was closed before the connection was established"},"connId":1}
+{"ts":"2025-10-30T02:10:49.465Z","event":"ai.socket.closed","detail":{"code":1006,"reason":{"type":"Buffer","data":[]}},"connId":1}
+{"ts":"2025-10-30T02:15:28.038Z","event":"client.connected","detail":{},"connId":2}
+{"ts":"2025-10-30T02:15:28.038Z","event":"security.key.prefix","detail":{"prefix":"sk-proj-"},"connId":2}
+{"ts":"2025-10-30T02:15:28.038Z","event":"ai.socket.connecting","detail":{"url":"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"},"connId":2}
+{"ts":"2025-10-30T02:15:28.047Z","event":"twilio.start","detail":{"sid":"SIM123","callSid":"SIM123"},"connId":2}
+📞 Twilio connected — recording mode active
+🎙️ Stream started for SIM123
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:15:28.048Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":2}
+{"ts":"2025-10-30T02:15:28.048Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":2}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:15:28.148Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":2}
+{"ts":"2025-10-30T02:15:28.148Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":2}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:15:28.249Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":2}
+{"ts":"2025-10-30T02:15:28.249Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":2}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:15:28.349Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":2}
+{"ts":"2025-10-30T02:15:28.350Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":2}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:15:28.451Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":2}
+{"ts":"2025-10-30T02:15:28.451Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":2}
+{"ts":"2025-10-30T02:15:28.551Z","event":"twilio.stop","detail":{"sid":"SIM123"},"connId":2}
+🛑 Stream ended
+{"ts":"2025-10-30T02:15:28.557Z","event":"client.closed","detail":{"code":1005,"reason":""},"connId":2}
+{"ts":"2025-10-30T02:15:28.557Z","event":"ai.socket.error","detail":{"message":"WebSocket was closed before the connection was established"},"connId":2}
+{"ts":"2025-10-30T02:15:28.557Z","event":"ai.socket.closed","detail":{"code":1006,"reason":{"type":"Buffer","data":[]}},"connId":2}
+{"ts":"2025-10-30T02:15:58.990Z","event":"client.connected","detail":{},"connId":3}
+{"ts":"2025-10-30T02:15:58.990Z","event":"security.key.prefix","detail":{"prefix":"sk-proj-"},"connId":3}
+{"ts":"2025-10-30T02:15:58.991Z","event":"ai.socket.connecting","detail":{"url":"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"},"connId":3}
+{"ts":"2025-10-30T02:15:58.996Z","event":"twilio.start","detail":{"sid":"SIM123","callSid":"SIM123"},"connId":3}
+📞 Twilio connected — recording mode active
+🎙️ Stream started for SIM123
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:15:58.997Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":3}
+{"ts":"2025-10-30T02:15:58.998Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":3}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:15:59.097Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":3}
+{"ts":"2025-10-30T02:15:59.097Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":3}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:15:59.198Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":3}
+{"ts":"2025-10-30T02:15:59.198Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":3}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:15:59.299Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":3}
+{"ts":"2025-10-30T02:15:59.299Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":3}
+📞 Twilio connected — recording mode active
+{"ts":"2025-10-30T02:15:59.400Z","event":"twilio.media","detail":{"bytes":160,"pcmBytes":320},"connId":3}
+{"ts":"2025-10-30T02:15:59.400Z","event":"whisper.error","detail":{"message":"Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'"},"connId":3}
+{"ts":"2025-10-30T02:15:59.451Z","event":"ai.socket.open","detail":{},"connId":3}
+{"ts":"2025-10-30T02:15:59.457Z","event":"ai.message.received","detail":{"bytes":1260,"isBinary":false},"connId":3}
+{"ts":"2025-10-30T02:15:59.458Z","event":"client.message.sent","detail":{"bytes":1260,"isBinary":false},"connId":3}
+{"ts":"2025-10-30T02:15:59.499Z","event":"twilio.stop","detail":{"sid":"SIM123"},"connId":3}
+🛑 Stream ended
+{"ts":"2025-10-30T02:15:59.502Z","event":"client.closed","detail":{"code":1005,"reason":""},"connId":3}
+{"ts":"2025-10-30T02:15:59.632Z","event":"ai.socket.closed","detail":{"code":1005,"reason":{"type":"Buffer","data":[]}},"connId":3}

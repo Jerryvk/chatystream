@@ -1,3 +1,4 @@
+pm2 logs chatty
 import express from "express";
 import expressWs from "express-ws";
 import WebSocket from "ws";

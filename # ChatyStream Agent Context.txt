@@ -1,0 +1,24 @@
+# ChatyStream Agent Context
+
+## Working Environment
+- Primary working directory: `/var/www/chatystream`
+- Use Node.js 20 with Express and WebSocket as the core environment
+- Integrated services: Twilio Media Streams and OpenAI Realtime API
+- You may create or modify subdirectories inside `/var/www/chatystream`:
+  `/modules`, `/logs`, `/tests`, `/environments`, `/personalities`
+- Avoid reading or writing in system paths such as `/usr`, `/lib`, `/proc`, `/var/log`, or `/snap`
+
+## Development Style
+- Follow incremental checkpoints defined in `ChatyStream_Roadmap.md`
+- Each new function can be retried up to three times before rollback, unless more attempts are logically required
+- Use modern async/await syntax instead of callbacks
+- Write code with clear, minimal comments and consistent naming
+- Do not remove working code unless a replacement is clearly required
+
+## Debug and Analysis
+- When an error occurs, inspect logs using `pm2 logs chatystream`
+- Only perform log checks when a functional error or crash occurs — not after every command
+- Always log runtime events and errors with timestamps  
+  Example:  
+  ```js
+  console.log(`[${new Date().toISOString()}] Incoming audio frame detected`);

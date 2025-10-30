@@ -1,0 +1,85 @@
+
+---
+
+## **📄 2. ChatyStream_Roadmap.md**
+
+```md
+# ChatyStream — Roadmap and Checkpoints
+Version: 30-10-2025
+
+## Overview
+ChatyStream is a Node.js engine that converts incoming Twilio calls into text in real time, processes them through GPT, and responds with generated audio over a single WebSocket connection.  
+Goal: full bidirectional voice interaction with optional N8n integrations for automated data storage and task execution.
+
+---
+
+## Chapter 1 – Core Infrastructure
+| No. | Component | Objective | Status |
+|-----|------------|------------|--------|
+| 1.1 | VPS + Node.js + Nginx + PM2 | Stable 24/7 server runtime | ✅ |
+| 1.2 | `/stream-gateway` endpoint | Active WebSocket bridge Twilio ↔ ChatyStream | ✅ |
+| 1.3 | Test-audio playback on incoming call | TwiML playback confirmed | ✅ |
+
+**Checkpoint 4 reached:**  
+Incoming calls are received, test audio plays, and “Streaming started” message confirmed.
+
+---
+
+## Chapter 2 – Audio Streaming (Realtime Engine)
+| No. | Function | Description | Expected Output |
+|-----|-----------|--------------|----------------|
+| 2.1 | Receive audio (Twilio → Gateway) | Decode and buffer PCM16 base64 frames | Console logs show inbound audio volume |
+| 2.2 | Forward audio (Gateway → OpenAI Realtime) | Stream PCM16 data to Realtime API via WebSocket | `transcript.delta` events appear |
+| 2.3 | Return audio (OpenAI → Gateway → Twilio) | Send GPT audio-delta back to Twilio | AI voice response is heard live |
+| 2.4 | Keep-alive / heartbeat | Ping every 10 s between Twilio and OpenAI | No connection timeouts |
+
+**Checkpoint 5:**  
+Live AI voice playback during an active phone call.
+
+---
+
+## Chapter 3 – Language Processing
+| No. | Function | Description | Output |
+|-----|-----------|--------------|--------|
+| 3.1 | Whisper auto-transcription | Real-time speech-to-text | Text lines visible in logs |
+| 3.2 | GPT response generation | Process text into structured or natural reply | `message` event with AI text |
+| 3.3 | Text-to-Speech (TTS) | Convert GPT reply to audio-delta frames | Playable audio in Twilio call |
+
+**Checkpoint 6:**  
+Spoken input → GPT response → audible AI reply confirmed.
+
+---
+
+## Chapter 4 – Personality and Logic
+| No. | Function | Description |
+|-----|-----------|--------------|
+| 4.1 | Personality filter | Context prompt defining tone and role (e.g., restaurant bot) |
+| 4.2 | Conversation loop | Maintain short-term memory across multiple turns |
+| 4.3 | Intent recognition | Detect booking details like date, time, and number of people |
+
+**Checkpoint 7:**  
+Chaty responds consistently with a defined persona and guides users through menu choices.
+
+---
+
+## Chapter 5 – N8n Integrations
+| No. | Function | Description |
+|-----|-----------|--------------|
+| 5.1 | Parse-data node | Convert conversation data to structured JSON for N8n |
+| 5.2 | GitHub commit or API call | Store conversations or reservations |
+| 5.3 | Automated flows | Example: reservation → Google Sheets entry |
+
+**Checkpoint 8:**  
+Conversation data automatically stored and reusable across workflows.
+
+---
+
+## Chapter 6 – Optimization and Release
+| No. | Function | Description |
+|-----|-----------|--------------|
+| 6.1 | Logging and Monitoring | PM2 dashboards and Twilio streaming logs |
+| 6.2 | Latency reduction | Buffer optimization and multithreading |
+| 6.3 | Personality testing | Multiple bot profiles via configuration |
+
+**Checkpoint 9 (MVP):**  
+ChatyStream runs in real time, understands context, and logs all interactions automatically.

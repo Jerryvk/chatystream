@@ -1,7 +1,8 @@
 nohup: ignoring input
-🧠 HTTPS-server wordt aangemaakt op: 2025-10-30T01:32:52.860Z
+🧠 HTTPS-server wordt aangemaakt op: 2025-10-30T02:00:37.357Z
 🌐 HTTP-server draait op poort 3000
-🧠 SecureServer luistert op poort 3001: 2025-10-30T01:32:52.902Z
-{"ts":"2025-10-30T01:33:22.488Z","event":"twiml.request","detail":{"path":"/twiml","method":"POST"}}
-{"ts":"2025-10-30T01:34:26.494Z","event":"twiml.request","detail":{"path":"/twiml","method":"POST"}}
-{"ts":"2025-10-30T01:35:39.643Z","event":"twiml.request","detail":{"path":"/twiml","method":"POST"}}
+🧠 SecureServer luistert op poort 3001: 2025-10-30T02:00:37.379Z
+{"ts":"2025-10-30T02:00:51.038Z","event":"twiml.request","detail":{"path":"/twiml"}}
+{"ts":"2025-10-30T02:01:06.867Z","event":"twiml.request","detail":{"path":"/twiml"}}
+{"ts":"2025-10-30T02:02:01.680Z","event":"twiml.request","detail":{"path":"/twiml"}}
+{"ts":"2025-10-30T02:21:47.831Z","event":"twiml.request","detail":{"path":"/twiml"}}

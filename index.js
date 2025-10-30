@@ -7,26 +7,28 @@ import https from "https";
 // HTTP-server
 // ======================
 
+function nowTs() {
+  return new Date().toISOString();
+}
+
+function logEvent(event, detail = {}) {
+  const out = { ts: nowTs(), event, detail };
+  try { console.log(JSON.stringify(out)); } catch (e) { console.log(JSON.stringify({ ts: nowTs(), event: 'log.error', detail: { message: 'log serialization failed' } })); }
+}
+
 const server = http.createServer((req, res) => {
-  // TwiML endpoint: respond with TwiML XML for Twilio to start Media Stream
-  try {
-    const method = req.method || 'GET';
-    const url = req.url || '/';
-    if (url === '/twiml') {
-      const twiml = `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Start>\n    <Stream name="chaty" url="wss://chatystream.chat/stream-gateway" />\n  </Start>\n  <Say>Streaming started.</Say>\n</Response>`;
-      res.writeHead(200, { 'Content-Type': 'text/xml' });
-      res.end(twiml);
-      // structured log for TwiML request
-      console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'twiml.request', detail: { path: '/twiml', method } }));
-      return;
-    }
-  } catch (err) {
-    // fallthrough to not-found
+  // TwiML endpoint: respond with XML to instruct Twilio to start Media Stream
+  if (req.url === '/twiml') {
+    logEvent('twiml.request', { path: '/twiml' });
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Start>\n    <Stream name="chaty"\n            url="wss://chatystream.chat/stream-gateway" />\n  </Start>\n  <Say>Streaming started.</Say>\n</Response>`;
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end(twiml);
+    return;
   }
 
-  // default: not found (remove previous plain-text hello response)
-  res.writeHead(404, { "Content-Type": "text/plain" });
-  res.end("Not Found");
+  // Default response for other paths
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Hello from Chatystream backend!");
 });
 
 server.listen(3000, () => {
