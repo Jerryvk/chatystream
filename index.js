@@ -8,8 +8,25 @@ import https from "https";
 // ======================
 
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Hello from Chatystream backend!");
+  // TwiML endpoint: respond with TwiML XML for Twilio to start Media Stream
+  try {
+    const method = req.method || 'GET';
+    const url = req.url || '/';
+    if (url === '/twiml') {
+      const twiml = `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Start>\n    <Stream name="chaty" url="wss://chatystream.chat/stream-gateway" />\n  </Start>\n  <Say>Streaming started.</Say>\n</Response>`;
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml);
+      // structured log for TwiML request
+      console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'twiml.request', detail: { path: '/twiml', method } }));
+      return;
+    }
+  } catch (err) {
+    // fallthrough to not-found
+  }
+
+  // default: not found (remove previous plain-text hello response)
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("Not Found");
 });
 
 server.listen(3000, () => {
