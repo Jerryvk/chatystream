@@ -1,0 +1,6 @@
+nohup: ignoring input
+🌐 WebSocket test running on port 3002
+2025-10-29T23:34:08.618Z ✅ Client connected to /echo (conn=1)
+2025-10-29T23:34:08.626Z 📩 Received from conn=1: hello
+2025-10-29T23:34:08.628Z 🔁 Sent to conn=1: Echo: hello
+2025-10-29T23:34:08.635Z 🔌 Connection closed (conn=1)

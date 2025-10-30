@@ -1,0 +1,20 @@
+nohup: ignoring input
+[dotenv@17.2.3] injecting env (4) from environments/.env -- tip: ⚙️  override existing env vars with { override: true }
+{"ts":"2025-10-30T00:25:46.245Z","event":"gateway.start","detail":{"port":3002}}
+{"ts":"2025-10-30T00:25:46.245Z","event":"security.key.prefix","detail":{"prefix":"sk-proj-"}}
+{"ts":"2025-10-30T00:25:46.254Z","event":"gateway.start","detail":{"port":3002}}
+Chatty Stream Gateway active on :3002
+{"ts":"2025-10-30T00:26:29.765Z","event":"client.connected","detail":{},"connId":1}
+{"ts":"2025-10-30T00:26:29.768Z","event":"security.key.prefix","detail":{"prefix":"sk-proj-"},"connId":1}
+{"ts":"2025-10-30T00:26:29.768Z","event":"ai.socket.connecting","detail":{"url":"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"},"connId":1}
+{"ts":"2025-10-30T00:26:29.798Z","event":"client.message.received","detail":{"bytes":4,"isBinary":false},"connId":1}
+{"ts":"2025-10-30T00:26:29.799Z","event":"buffer.stored","detail":{"bytes":4,"isBinary":false,"buffered":true},"connId":1}
+{"ts":"2025-10-30T00:26:29.799Z","event":"client.message.sent","detail":{"bytes":4,"buffered":true},"connId":1}
+{"ts":"2025-10-30T00:26:30.290Z","event":"ai.socket.open","detail":{},"connId":1}
+{"ts":"2025-10-30T00:26:30.292Z","event":"buffer.flushed","detail":{"flushedCount":1,"flushedBytes":4},"connId":1}
+{"ts":"2025-10-30T00:26:30.295Z","event":"ai.message.received","detail":{"bytes":1260,"isBinary":false},"connId":1}
+{"ts":"2025-10-30T00:26:30.296Z","event":"client.message.sent","detail":{"bytes":1260,"isBinary":false},"connId":1}
+{"ts":"2025-10-30T00:26:30.301Z","event":"client.closed","detail":{"code":1005,"reason":""},"connId":1}
+{"ts":"2025-10-30T00:26:30.430Z","event":"ai.message.received","detail":{"bytes":352,"isBinary":false},"connId":1}
+{"ts":"2025-10-30T00:26:30.431Z","event":"client.closed","detail":{"reason":"client_not_open"},"connId":1}
+{"ts":"2025-10-30T00:26:30.438Z","event":"ai.socket.closed","detail":{"code":1005,"reason":{"type":"Buffer","data":[]}},"connId":1}
