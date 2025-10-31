@@ -1,6 +1,7 @@
 import express from "express";
 import expressWs from "express-ws";
 import WebSocket from "ws";
+import fs from 'fs';
 import dotenv from "dotenv";
 import OpenAI from "openai";
 
@@ -158,12 +159,231 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
   if (OPENAI_KEY) logEvent('security.key.prefix', { prefix: String(OPENAI_KEY).slice(0, 8) }, connId);
 
   const aiUrl = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview';
-  logEvent('ai.socket.connecting', { url: aiUrl }, connId);
-  const aiSocket = new WebSocket(aiUrl, {
-    headers: {
+
+  // AI socket and reconnect state
+  let aiSocket = null;
+  let aiRetries = 0;
+  const AI_MAX_RETRIES = 6;
+  const AI_HANDSHAKE_TIMEOUT = 12000; // 12s
+
+  // Track whether we've sent any audio since last commit; used by periodic committer
+  let pendingAudioSinceLastCommit = false;
+  // Track if we received any transcript output (used to mark checkpoint on stream end)
+  let sawTranscriptOutput = false;
+  // Accumulate speech frames (PCM16 Buffer objects) to batch before commit
+  let pendingFrames = [];
+
+  function scheduleAiConnect(delay = 0) {
+    setTimeout(() => connectToAi(), delay);
+  }
+
+  function connectToAi() {
+    const url = aiUrl;
+    logEvent('ai.socket.connecting', { url, attempt: aiRetries + 1 }, connId);
+
+    const headers = {
       Authorization: `Bearer ${OPENAI_KEY}`,
-    },
-  });
+      'OpenAI-Beta': 'realtime=v1',
+    };
+
+    aiSocket = new WebSocket(url, { headers, handshakeTimeout: AI_HANDSHAKE_TIMEOUT });
+
+    // Connection timeout guard (in case handshake stalls)
+    const connectTimer = setTimeout(() => {
+      logEvent('ai.socket.connect.timeout', { timeoutMs: AI_HANDSHAKE_TIMEOUT }, connId);
+      try { aiSocket.terminate(); } catch (e) {}
+    }, AI_HANDSHAKE_TIMEOUT + 2000);
+
+    aiSocket.on('open', () => {
+      clearTimeout(connectTimer);
+      aiRetries = 0;
+      logEvent('ai.socket.open', { url }, connId);
+      // Human-friendly log for PM2/tests
+      console.log(`[${nowTs()}] connected to OpenAI Realtime`);
+
+      // flush pendingMessages FIFO (existing logic)
+      let flushedCount = 0;
+      let flushedBytes = 0;
+      const now = Date.now();
+      while (pendingMessages.length > 0) {
+        const item = pendingMessages.shift();
+        if (!item) continue;
+        const age = now - item.ts;
+        if (age > 30000) {
+          // expired
+          logEvent('buffer.expired', { bytes: item.bytes, age }, connId);
+          pendingBytes -= item.bytes || 0;
+          continue;
+        }
+        try {
+          aiSocket.send(item.payload);
+          flushedCount += 1;
+          flushedBytes += item.bytes || 0;
+          pendingBytes -= item.bytes || 0;
+        } catch (e) {
+          logEvent('ai.socket.error', { message: String(e && e.message ? e.message : e) }, connId);
+        }
+      }
+      if (flushedCount > 0) logEvent('buffer.flushed', { flushedCount, flushedBytes }, connId);
+    });
+
+    // Unexpected-response gives access to HTTP status codes (e.g., 401/403)
+    aiSocket.on('unexpected-response', (req, res) => {
+      try {
+        const code = res && res.statusCode;
+        logEvent('ai.socket.unexpected_response', { statusCode: code }, connId);
+        if (code === 401 || code === 403) {
+          // auth problem: retry with backoff (do not infinite loop)
+          if (aiRetries < AI_MAX_RETRIES) {
+            aiRetries++;
+            const backoff = Math.pow(2, aiRetries) * 1000;
+            logEvent('ai.socket.auth_retry', { attempt: aiRetries, backoff }, connId);
+            try { aiSocket.terminate(); } catch (e) {}
+            scheduleAiConnect(backoff);
+          } else {
+            logEvent('ai.socket.auth_failed', { attempts: aiRetries }, connId);
+          }
+        }
+      } catch (e) {
+        logEvent('ai.socket.unexpected_response.error', { message: String(e && e.message ? e.message : e) }, connId);
+      }
+    });
+
+    // Forward AI -> client: handle incoming realtime events and print partial transcripts
+    aiSocket.on('message', (msg, isBinary) => {
+      lastAiActivity = Date.now();
+      const bytes = byteLen(msg);
+      logEvent('ai.message.received', { bytes, isBinary: !!isBinary }, connId);
+
+      // Try to parse AI message as JSON and log
+      let parsedAi = null;
+      try {
+        const txt = typeof msg === 'string' ? msg : msg.toString();
+        parsedAi = JSON.parse(txt);
+      } catch (e) {
+        parsedAi = null;
+      }
+
+      // Log the raw event for debugging/inspection
+      try {
+        logEvent('openai.event', { raw: parsedAi || msg }, connId);
+      } catch (e) {
+        // ignore logging serialization failures
+      }
+
+      // Print partial transcript when OpenAI returns response.output_text.delta
+      try {
+        if (parsedAi && parsedAi.type === 'response.output_text.delta') {
+          const deltaText = parsedAi.delta && (parsedAi.delta.content || parsedAi.delta) ? (parsedAi.delta.content || parsedAi.delta) : (parsedAi.text || '');
+          if (deltaText) {
+            // Explicit transcript console line as requested
+            try {
+              const maybeDelta = typeof parsedAi.delta !== 'undefined' ? parsedAi.delta : parsedAi.text;
+              console.log(`[${nowTs()}] OpenAI transcript: ${JSON.stringify(maybeDelta)}`);
+            } catch (e) {
+              console.log(`[${nowTs()}] OpenAI transcript: ${deltaText}`);
+            }
+            logEvent('openai.transcript.delta', { text: deltaText }, connId);
+            sawTranscriptOutput = true;
+          }
+        }
+
+        // Backwards/compat: older events called transcript.delta
+        if (parsedAi && parsedAi.type === 'transcript.delta') {
+          const text = parsedAi.text || (parsedAi.delta && parsedAi.delta.text) || '';
+          console.log(`[${nowTs()}] OpenAI transcript: ${JSON.stringify(parsedAi.delta || text)}`);
+          logEvent('openai.transcript.delta', { text }, connId);
+          sawTranscriptOutput = true;
+        }
+      } catch (e) {
+        logEvent('openai.event.parse_error', { message: String(e && e.message ? e.message : e) }, connId);
+      }
+
+      // Forward to connected client if present
+      try {
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.send(msg);
+          logEvent('client.message.sent', { bytes, isBinary: !!isBinary }, connId);
+        }
+      } catch (e) {
+        logEvent('client.forward.error', { message: String(e && e.message ? e.message : e) }, connId);
+      }
+    });
+
+    aiSocket.on('error', (err) => {
+      logEvent('ai.socket.error', { message: String(err && err.message ? err.message : err) }, connId);
+      // Terminate and schedule retry
+      try { aiSocket.terminate(); } catch (e) {}
+      if (aiRetries < AI_MAX_RETRIES) {
+        aiRetries++;
+        const backoff = Math.pow(2, aiRetries) * 1000;
+        logEvent('ai.socket.retry_scheduled', { attempt: aiRetries, backoff }, connId);
+        scheduleAiConnect(backoff);
+      } else {
+        logEvent('ai.socket.retries_exhausted', { attempts: aiRetries }, connId);
+      }
+    });
+
+    aiSocket.on('close', (code, reason) => {
+      logEvent('ai.socket.closed', { code, reason: reason && reason.toString ? reason.toString() : reason }, connId);
+      // schedule reconnect for transient failures
+      if (code === 1006 || code === 1011 || code === 1001) {
+        if (aiRetries < AI_MAX_RETRIES) {
+          aiRetries++;
+          const backoff = Math.pow(2, aiRetries) * 1000;
+          logEvent('ai.socket.closed.retry', { attempt: aiRetries, backoff }, connId);
+          scheduleAiConnect(backoff);
+        } else {
+          logEvent('ai.socket.closed.no_more_retries', { attempts: aiRetries }, connId);
+        }
+      }
+      // if client open, keep client connected; other cleanup handled on client close
+    });
+
+    // aiSocket.on('message') handler will be attached below (re-usable reference)
+  }
+
+  // Start initial connect
+  connectToAi();
+
+  // Periodic committer: every ~1s, if we've appended any audio since last commit, commit and request a response.
+  const COMMIT_INTERVAL_MS = 1000;
+  const commitTimer = setInterval(() => {
+    try {
+      // If we have queued frames, batch them into a single append before committing
+      if (pendingFrames.length > 0) {
+        console.log(`[${nowTs()}] batching ${pendingFrames.length} frames before commit`);
+        const combined = Buffer.concat(pendingFrames);
+        const audioB64 = combined.toString('base64');
+        const appendMsg = JSON.stringify({ type: 'input_audio_buffer.append', audio: audioB64 });
+
+        if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
+          aiSocket.send(appendMsg);
+          console.log(`[${nowTs()}] sent combined input_audio_buffer.append (${pendingFrames.length} frames, ${combined.length} bytes)`);
+          logEvent('openai.audio.sent', { combinedFrames: pendingFrames.length, bytes: combined.length }, connId);
+        } else {
+          // Buffer the combined append for flushing later
+          bufferStore({ ts: Date.now(), bytes: combined.length, isBinary: false, payload: appendMsg });
+          logEvent('openai.audio.buffered_combined', { combinedFrames: pendingFrames.length, bytes: combined.length }, connId);
+        }
+
+        // After sending/appending, commit and create a response
+  const commitMsg = JSON.stringify({ type: 'input_audio_buffer.commit' });
+  const createMsg = JSON.stringify({ type: 'response.create', response: { modalities: ['text'], instructions: 'transcribe the audio in Dutch' } });
+        console.log(`[${nowTs()}] sending input_audio_buffer.commit`);
+        if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(commitMsg);
+        console.log(`[${nowTs()}] sending response.create (transcribe)`);
+        if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(createMsg);
+        logEvent('openai.commit.sent', { commitBytes: combined.length, frames: pendingFrames.length }, connId);
+
+        // clear pending frames
+        pendingFrames.length = 0;
+        pendingAudioSinceLastCommit = false;
+      }
+    } catch (e) {
+      logEvent('openai.commit.error', { message: String(e && e.message ? e.message : e) }, connId);
+    }
+  }, COMMIT_INTERVAL_MS);
 
   let lastClientActivity = Date.now();
   let lastAiActivity = Date.now();
@@ -281,7 +501,21 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
             // Also emit structured event for diagnostics
             logEvent('twilio.media', { bytes: raw.length, pcmBytes: pcm16Buffer.length, rms }, connId);
 
-            // NOTE: Do not forward or transcribe Twilio audio in Section 2.1. This step only verifies incoming audio.
+            // Forward PCM16 audio to OpenAI Realtime WebSocket as base64-encoded messages
+            try {
+              // Only queue audio frames when RMS indicates speech (> 0.1). Otherwise skip silence.
+              if (rms > 0.1) {
+                pendingAudioSinceLastCommit = true;
+                // store the PCM16 Buffer locally for batching
+                pendingFrames.push(pcm16Buffer);
+                logEvent('openai.audio.queued', { bytes: pcm16Buffer.length, rms, pendingFrames: pendingFrames.length }, connId);
+              } else {
+                // silence — skip queuing
+                logEvent('openai.audio.skip_silence', { bytes: pcm16Buffer.length, rms }, connId);
+              }
+            } catch (e) {
+              logEvent('openai.forward.error', { message: String(e && e.message ? e.message : e) }, connId);
+            }
           } catch (e) {
             logEvent('twilio.error', { message: String(e && e.message ? e.message : e) }, connId);
           }
@@ -290,6 +524,55 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
         logEvent('twilio.stop', { sid: parsed.streamSid }, connId);
         // human-friendly log for checklist
         console.log(`[${nowTs()}] Stream ended`);
+
+        // If there's pending audio that hasn't been committed yet, try to commit it now
+        try {
+          if (pendingFrames.length > 0) {
+            console.log(`[${nowTs()}] batching ${pendingFrames.length} frames before commit (on stop)`);
+            const combined = Buffer.concat(pendingFrames);
+            const audioB64 = combined.toString('base64');
+            const appendMsg = JSON.stringify({ type: 'input_audio_buffer.append', audio: audioB64 });
+
+            if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
+              aiSocket.send(appendMsg);
+              console.log(`[${nowTs()}] sent combined input_audio_buffer.append (${pendingFrames.length} frames, ${combined.length} bytes) (on stop)`);
+              logEvent('openai.audio.sent', { combinedFrames: pendingFrames.length, bytes: combined.length }, connId);
+            } else {
+              bufferStore({ ts: Date.now(), bytes: combined.length, isBinary: false, payload: appendMsg });
+              logEvent('openai.audio.buffered_combined', { combinedFrames: pendingFrames.length, bytes: combined.length }, connId);
+            }
+
+            const commitMsg = JSON.stringify({ type: 'input_audio_buffer.commit' });
+            const createMsg = JSON.stringify({ type: 'response.create', response: { modalities: ['text'], instructions: 'transcribe the audio in Dutch' } });
+            try {
+              console.log(`[${nowTs()}] sending input_audio_buffer.commit (on stop)`);
+              if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(commitMsg);
+              console.log(`[${nowTs()}] sending response.create (transcribe) (on stop)`);
+              if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(createMsg);
+              logEvent('openai.commit.sent.on_stop', { bytes: combined.length, frames: pendingFrames.length }, connId);
+            } catch (e) {
+              logEvent('openai.commit.on_stop.error', { message: String(e && e.message ? e.message : e) }, connId);
+            }
+
+            pendingFrames.length = 0;
+            pendingAudioSinceLastCommit = false;
+          }
+        } catch (e) {
+          logEvent('openai.commit.on_stop.error', { message: String(e && e.message ? e.message : e) }, connId);
+        }
+
+        // Mark checkpoint if we received transcript output
+        try {
+          if (sawTranscriptOutput) {
+            const ck = `2.2 Completed — Audio Forwarded and Transcribed - ${new Date().toISOString()}\n`;
+            try { fs.appendFileSync('/var/www/chatystream/.checkpoints', ck); } catch (e) { /* best-effort */ }
+            logEvent('checkpoint.2.2.marked', { note: '2.2 Completed — Audio Forwarded and Transcribed' }, connId);
+          }
+
+        } catch (e) {
+          logEvent('checkpoint.error', { message: String(e && e.message ? e.message : e) }, connId);
+        }
+
         // clear any minimal state we kept
         if (clientWs._twilio) clientWs._twilio = null;
       }
@@ -299,7 +582,7 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
 
     logEvent('client.message.received', { bytes, isBinary: !!isBinary }, connId);
 
-    if (aiSocket.readyState === WebSocket.OPEN) {
+  if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
       try {
         aiSocket.send(msg);
         logEvent('ai.message.sent', { bytes, isBinary: !!isBinary }, connId);
@@ -313,71 +596,7 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
     }
   });
 
-  // Forward AI -> client
-  aiSocket.on('message', (msg, isBinary) => {
-    lastAiActivity = Date.now();
-    const bytes = byteLen(msg);
-    logEvent('ai.message.received', { bytes, isBinary: !!isBinary }, connId);
-
-    try {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(msg);
-        logEvent('client.message.sent', { bytes, isBinary: !!isBinary }, connId);
-      } else {
-        logEvent('client.closed', { reason: 'client_not_open' }, connId);
-      }
-    } catch (e) {
-      logEvent('client.closed', { message: String(e && e.message ? e.message : e) }, connId);
-    }
-  });
-
-  aiSocket.on('open', () => {
-    logEvent('ai.socket.open', {}, connId);
-    // flush pendingMessages FIFO
-    let flushedCount = 0;
-    let flushedBytes = 0;
-    const now = Date.now();
-    while (pendingMessages.length > 0) {
-      const item = pendingMessages.shift();
-      if (!item) continue;
-      const age = now - item.ts;
-      if (age > 30000) {
-        // expired
-        logEvent('buffer.expired', { bytes: item.bytes, age }, connId);
-        pendingBytes -= item.bytes || 0;
-        continue;
-      }
-      try {
-        aiSocket.send(item.payload);
-        flushedCount += 1;
-        flushedBytes += item.bytes || 0;
-        pendingBytes -= item.bytes || 0;
-      } catch (e) {
-        logEvent('ai.socket.error', { message: String(e && e.message ? e.message : e) }, connId);
-      }
-    }
-    if (flushedCount > 0) logEvent('buffer.flushed', { flushedCount, flushedBytes }, connId);
-  });
-
-  aiSocket.on('close', (code, reason) => {
-    logEvent('ai.socket.closed', { code, reason }, connId);
-    // if client open, close it
-    if (clientWs.readyState === WebSocket.OPEN) clientWs.close();
-    // if pending messages remain, log drop
-    if (pendingMessages.length > 0) {
-      let droppedBytes = pendingMessages.reduce((s, it) => s + (it.bytes || 0), 0);
-      let droppedCount = pendingMessages.length;
-      pendingMessages.length = 0;
-      pendingBytes = 0;
-      logEvent('buffer.drop', { droppedCount, droppedBytes, reason: 'socket_closed' }, connId);
-    }
-  });
-
-  aiSocket.on('error', (err) => {
-    logEvent('ai.socket.error', { message: String(err && err.message ? err.message : err) }, connId);
-    try { aiSocket.terminate(); } catch (e) {}
-    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ error: 'AI_SOCKET_ERROR', message: String(err && err.message ? err.message : err) }));
-  });
+  
 
   clientWs.on('close', (code, reason) => {
     logEvent('client.closed', { code, reason }, connId);
@@ -390,6 +609,7 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
       logEvent('buffer.drop', { droppedCount, droppedBytes, reason: 'client_closed' }, connId);
     }
     clearInterval(heartbeatTimer);
+    try { clearInterval(commitTimer); } catch (e) {}
   });
 
   clientWs.on('error', (err) => {
@@ -404,6 +624,7 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
       logEvent('buffer.drop', { droppedCount, droppedBytes, reason: 'client_error' }, connId);
     }
     clearInterval(heartbeatTimer);
+    try { clearInterval(commitTimer); } catch (e) {}
   });
 
   // Heartbeat: ping AI and client every 10s; close if no activity for 30s
