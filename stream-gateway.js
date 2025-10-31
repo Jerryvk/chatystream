@@ -76,13 +76,20 @@ function decodeMuLawBuffer(buf) {
   for (let i = 0; i < buf.length; i++) {
     const pcm = ulawToPcm16(buf[i]);
     // Coerce to integer and clamp to signed 16-bit range to avoid RangeError
-    const v = Math.max(-32768, Math.min(32767, Math.round(Number(pcm) || 0)));
+    // Coerce to integer and clamp to signed 16-bit range to avoid RangeError
+    let v = Math.round(Number(pcm) || 0);
+    if (!Number.isFinite(v)) v = 0;
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    // As a final safeguard, force into signed 16-bit via bit ops (wraps any out-of-range values)
+    const v16 = (v << 16) >> 16;
     try {
-      out.writeInt16LE(v, i * 2);
+      out.writeInt16LE(v16, i * 2);
     } catch (err) {
       // Defensive: log the bad value and continue (do not crash the whole process)
-      console.error('decodeMuLawBuffer: writeInt16LE failed', { index: i, pcm, coerced: v, err: String(err && err.message ? err.message : err) });
-      out.writeInt16LE(v & 0xffff, i * 2);
+      console.error('decodeMuLawBuffer: writeInt16LE failed', { index: i, pcm, coerced: v, coerced16: v16, err: String(err && err.message ? err.message : err) });
+      // Worst-case fallback: write zero so we don't crash
+      try { out.writeInt16LE(0, i * 2); } catch (e) { /* swallow */ }
     }
   }
   return out;
@@ -96,13 +103,17 @@ function muLawToPCM16(buffer) {
     // reuse the small, well-tested ulaw decoder above
     let pcm = ulawToPcm16(buffer[i]);
     // Ensure pcm is a finite number, coerce and clamp to signed 16-bit range
-    const v = Math.max(-32768, Math.min(32767, Math.round(Number(pcm) || 0)));
+    let v = Math.round(Number(pcm) || 0);
+    if (!Number.isFinite(v)) v = 0;
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    // Final safeguard: force into signed 16-bit via bit ops
+    const v16 = (v << 16) >> 16;
     try {
-      out.writeInt16LE(v, i * 2);
+      out.writeInt16LE(v16, i * 2);
     } catch (err) {
-      // Defensive: log and write a safe value to avoid crashing entire gateway
-      console.error('muLawToPCM16: writeInt16LE failed', { index: i, pcm, coerced: v, err: String(err && err.message ? err.message : err) });
-      out.writeInt16LE(v & 0xffff, i * 2);
+      console.error('muLawToPCM16: writeInt16LE failed', { index: i, pcm, coerced: v, coerced16: v16, err: String(err && err.message ? err.message : err) });
+      try { out.writeInt16LE(0, i * 2); } catch (e) { /* swallow */ }
     }
   }
   return out;
@@ -186,6 +197,56 @@ async function transcribeBufferWithRetry(connId, wavBuffer) {
 wsApp.ws('/stream-gateway', (clientWs, req) => {
   const connId = ++connCounter;
   logEvent('client.connected', {}, connId);
+  
+  // Per-call log stream (created on Twilio 'start', closed on 'stop')
+  let callLogStream = null;
+  let callLogPath = null;
+  
+  function ensureLogsDir() {
+    const dir = '/var/www/chatystream/logs/calls';
+    try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* best-effort */ }
+    return dir;
+  }
+  
+  function createCallLog(callSid) {
+    const dir = ensureLogsDir();
+    const safeSid = String(callSid || `conn${connId}`).replace(/[^a-zA-Z0-9-_\.]/g, '_');
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const fname = `${ts}_${safeSid}.log`;
+    callLogPath = `${dir}/${fname}`;
+    try {
+      callLogStream = fs.createWriteStream(callLogPath, { flags: 'a' });
+      callLogStream.write(`${nowTs()} CALL_START: ${safeSid}\n`);
+    } catch (e) {
+      console.error('createCallLog failed', e && e.message ? e.message : e);
+      callLogStream = null;
+    }
+    return callLogPath;
+  }
+  
+  function appendCallLog(line) {
+    try {
+      if (callLogStream) callLogStream.write(`${nowTs()} ${line}\n`);
+    } catch (e) {
+      // best-effort — do not crash
+      console.error('appendCallLog failed', e && e.message ? e.message : e);
+    }
+  }
+
+  // Ensure a per-call log exists even if a Twilio 'start' hasn't been received yet.
+  // This prevents losing OpenAI transcript/assistant deltas that may arrive early.
+  function ensureCallLogExists() {
+    try {
+      if (!callLogStream) {
+        // create a fallback call log using the connId so we have a place to write deltas
+        createCallLog(`conn${connId}`);
+        appendCallLog(`AUTOCREATE_CALLLOG: created fallback log for conn${connId}`);
+      }
+    } catch (e) {
+      // best-effort
+      console.error('ensureCallLogExists failed', e && e.message ? e.message : e);
+    }
+  }
 
   const OPENAI_KEY = process.env.OPENAI_KEY || process.env.OPENAI_API_KEY || process.env.OPENAI_API;
   // Log key prefix per connection as well
@@ -203,10 +264,53 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
   let pendingAudioSinceLastCommit = false;
   // Track if we received any transcript output (used to mark checkpoint on stream end)
   let sawTranscriptOutput = false;
+  // Track if we received any assistant output (response.text.delta / response.output_text.delta)
+  let sawAssistantOutput = false;
+  // Track whether we've sent a session.update announcing input audio format and transcription mode
+  let sessionUpdateSent = false;
   // Accumulate speech frames (PCM16 Buffer objects) to batch before commit
   let pendingFrames = [];
   // smoothed RMS value
   let rmsa = 0;
+
+  // Helper to build the session.update payload that requests pcm16 and transcription mode.
+  function makeSessionUpdateMsg() {
+    // Include both nested and flattened conversation mode fields to be tolerant of API shape expectations.
+    // Add input_audio_transcription flag to request realtime transcription behavior from the service.
+    // Use a permissive value (true) so the realtime session will attempt to transcribe incoming audio and emit
+    // transcript events when available.
+    return JSON.stringify({
+      type: 'session.update',
+      session: {
+        input_audio_format: 'pcm16',
+        // ask the realtime session to produce transcripts for input audio
+        input_audio_transcription: true,
+        conversation: { mode: 'transcription' },
+        conversation_mode: 'transcription'
+      }
+    });
+  }
+
+  // Heuristic: detect assistant outputs that are actually transcriptions of caller audio.
+  // Returns true when the assistant text looks like a transcription in Dutch.
+  function isLikelyAssistantTranscript(txt) {
+    if (!txt) return false;
+    try {
+      const s = String(txt).trim().toLowerCase();
+      // Common Dutch phrases that the assistant has used when emitting a transcription
+      const patterns = [
+        'hier is de transcriptie',
+        'wat ik heb gehoord',
+        'de transcriptie van',
+        'ik heb gehoord',
+        'de transcriptie'
+      ];
+      for (const p of patterns) if (s.indexOf(p) !== -1) return true;
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
 
   function scheduleAiConnect(delay = 0) {
     setTimeout(() => connectToAi(), delay);
@@ -262,13 +366,14 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
       if (flushedCount > 0) logEvent('buffer.flushed', { flushedCount, flushedBytes }, connId);
       // Announce input audio format to the realtime session so server knows how to interpret appended audio
       try {
-  // The realtime API expects a simple enum for input_audio_format (pcm16/g711_ulaw/g711_alaw).
-  // Provide 'pcm16' here and include sample_rate on individual append messages.
-  const sessionUpdate = JSON.stringify({ type: 'session.update', session: { input_audio_format: 'pcm16' } });
+        // The realtime API expects a simple enum for input_audio_format (pcm16/g711_ulaw/g711_alaw).
+        // Provide 'pcm16' here and request conversation transcription mode.
+        const sessionUpdate = makeSessionUpdateMsg();
         if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
           aiSocket.send(sessionUpdate);
-          console.log(`[${nowTs()}] sent session.update (input_audio_format: pcm16)`);
-          logEvent('openai.session.update.sent', { input_audio_format: 'pcm16' }, connId);
+          sessionUpdateSent = true;
+          console.log(`[${nowTs()}] sent session.update (input_audio_format: pcm16, conversation:transcription)`);
+          logEvent('openai.session.update.sent', { input_audio_format: 'pcm16', conversation_mode: 'transcription' }, connId);
         } else {
           // buffer this session update for flushing later
           bufferStore({ ts: Date.now(), bytes: sessionUpdate.length, isBinary: false, payload: sessionUpdate });
@@ -323,35 +428,78 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
         // ignore logging serialization failures
       }
 
-      // Print partial transcript when OpenAI returns response.output_text.delta
+      // Handle assistant output parts and transcript.delta (caller speech)
       try {
+        // ASSISTANT partials: response.output_text.delta and response.text.delta
         if (parsedAi && (parsedAi.type === 'response.output_text.delta' || parsedAi.type === 'response.text.delta')) {
           const deltaText = parsedAi.delta && (parsedAi.delta.content || parsedAi.delta) ? (parsedAi.delta.content || parsedAi.delta) : (parsedAi.text || '');
           if (deltaText) {
-            // Print transcript with the exact requested format
-            try {
-              // trace enter for debugging ReferenceError issues
-              try { console.log(`[${nowTs()}] media.process.start decodedBytes=${Buffer.from(payloadB64, 'base64').length}`); } catch (err) {}
-              console.log(`[${nowTs()}] Transcript: ${String(deltaText)}`);
-              try { console.log(`[${nowTs()}] media.process.ok`); } catch (err) {}
-            } catch (e) {
-              console.log(`[${nowTs()}] Transcript: ${String(deltaText)}`);
+            const txt = String(deltaText).trim();
+            // If the assistant appears to be emitting a transcription, treat it as USER
+            if (isLikelyAssistantTranscript(txt)) {
+              try { console.log(`[${nowTs()}] USER: ${txt}`); } catch (e) {}
+              logEvent('openai.transcript.detected_from_assistant', { text: txt }, connId);
+              sawTranscriptOutput = true;
+              try { ensureCallLogExists(); appendCallLog(`[USER] ${txt}`); } catch (e) {}
+            } else {
+              // Normal assistant partial
+              try { console.log(`[${nowTs()}] ASSISTANT: ${txt}`); } catch (e) {}
+              logEvent('openai.assistant.delta', { text: txt }, connId);
+              sawAssistantOutput = true;
+              try { ensureCallLogExists(); appendCallLog(`[ASSISTANT] ${txt}`); } catch (e) {}
             }
-            logEvent('openai.transcript.delta', { text: deltaText }, connId);
-            sawTranscriptOutput = true;
           }
         }
 
-        // Backwards/compat: older events called transcript.delta
+        // Backwards/compat / explicit transcript.delta messages are caller speech (USER)
         if (parsedAi && parsedAi.type === 'transcript.delta') {
           const text = parsedAi.text || (parsedAi.delta && parsedAi.delta.text) || '';
-          console.log(`[${nowTs()}] Transcript: ${String(text)}`);
+          try { console.log(`[${nowTs()}] USER: ${String(text)}`); } catch (e) {}
           logEvent('openai.transcript.delta', { text }, connId);
           sawTranscriptOutput = true;
+          try { ensureCallLogExists(); appendCallLog(`[USER] ${String(text)}`); } catch (e) {}
         }
       } catch (e) {
         logEvent('openai.event.parse_error', { message: String(e && e.message ? e.message : e) }, connId);
       }
+
+      // Capture assistant final outputs or content parts into per-call log
+      try {
+        if (parsedAi && parsedAi.type === 'response.text.done' && parsedAi.text) {
+          try {
+            const txt = String(parsedAi.text || '').trim();
+            if (isLikelyAssistantTranscript(txt)) {
+              try { ensureCallLogExists(); appendCallLog(`[USER] ${txt}`); sawTranscriptOutput = true; } catch (e) {}
+            } else {
+              try { ensureCallLogExists(); appendCallLog(`[ASSISTANT] ${txt}`); sawAssistantOutput = true; } catch (e) {}
+            }
+          } catch (e) {}
+        }
+        if (parsedAi && parsedAi.type === 'response.content_part.done' && parsedAi.part && parsedAi.part.type === 'text' && parsedAi.part.text) {
+          try {
+            const txt = String(parsedAi.part.text || '').trim();
+            if (isLikelyAssistantTranscript(txt)) {
+              try { ensureCallLogExists(); appendCallLog(`[USER] ${txt}`); sawTranscriptOutput = true; } catch (e) {}
+            } else {
+              try { ensureCallLogExists(); appendCallLog(`[ASSISTANT] ${txt}`); sawAssistantOutput = true; } catch (e) {}
+            }
+          } catch (e) {}
+        }
+        if (parsedAi && parsedAi.type === 'response.done' && parsedAi.response) {
+          // try to extract a best-effort aggregated assistant text
+          try {
+            const out = parsedAi.response.output && parsedAi.response.output[0] && parsedAi.response.output[0].content && parsedAi.response.output[0].content.map(c=>c.text||'').join('');
+            if (out) {
+              const txt = String(out || '').trim();
+              if (isLikelyAssistantTranscript(txt)) {
+                try { ensureCallLogExists(); appendCallLog(`[USER] ${txt}`); sawTranscriptOutput = true; } catch (e) {}
+              } else {
+                try { ensureCallLogExists(); appendCallLog(`[ASSISTANT] ${txt}`); sawAssistantOutput = true; } catch (e) {}
+              }
+            }
+          } catch (e) {}
+        }
+      } catch (e) { /* best-effort */ }
 
       // Forward to connected client if present
       try {
@@ -435,11 +583,27 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
           logEvent('openai.audio.buffered_combined', { frames: pendingFrames.length, bytes: combined.length }, connId);
         }
 
-        // After sending/appending, wait a short time before committing to avoid race conditions
+        // After sending/appending, wait a short time before committing to avoid race conditions.
+        // Also ensure the session is updated to indicate pcm16 + transcription mode before commit.
         const commitMsg = JSON.stringify({ type: 'input_audio_buffer.commit' });
         const createMsg = JSON.stringify({ type: 'response.create', response: { modalities: ['text'], instructions: 'transcribe the audio in Dutch' } });
         setTimeout(() => {
           try {
+            // Always (re)announce session.update before committing so the realtime service is in transcription mode.
+            try {
+              const sess = makeSessionUpdateMsg();
+              if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
+                aiSocket.send(sess);
+                sessionUpdateSent = true;
+                logEvent('openai.session.update.sent.pre_commit', { note: 'sent before commit' }, connId);
+              } else {
+                bufferStore({ ts: Date.now(), bytes: sess.length, isBinary: false, payload: sess });
+                logEvent('openai.session.update.buffered.pre_commit', { bytes: sess.length }, connId);
+              }
+            } catch (se) {
+              logEvent('openai.session.update.pre_commit.error', { message: String(se && se.message ? se.message : se) }, connId);
+            }
+
             console.log(`[${nowTs()}] sending input_audio_buffer.commit`);
             if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(commitMsg);
             console.log(`[${nowTs()}] sending response.create (transcribe)`);
@@ -448,7 +612,7 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
           } catch (e) {
             logEvent('openai.commit.error', { message: String(e && e.message ? e.message : e) }, connId);
           }
-        }, 75);
+  }, 300);
 
         // clear pending frames only after scheduling commit
         pendingFrames.length = 0;
@@ -538,6 +702,8 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
         logEvent('twilio.start', { sid: parsed.streamSid || parsed.session }, connId);
         // human-friendly log for checklist
         console.log(`[${nowTs()}] Twilio connected`);
+        // Create per-call log file for this Twilio stream
+        try { createCallLog(parsed.streamSid || parsed.session || `conn${connId}`); appendCallLog(`TWILIO_START: ${JSON.stringify({ sid: parsed.streamSid || parsed.session })}`); } catch (e) {}
         // initialize per-connection audio state (kept minimal for future steps)
         clientWs._twilio = clientWs._twilio || { seen: true };
       } else if (parsed.event === 'media') {
@@ -573,6 +739,8 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
 
             // Also emit structured event for diagnostics
             logEvent('twilio.media', { bytes: rawMuLaw.length, pcmBytes: pcm16Buffer.length, rms, rmsa }, connId);
+            // Optionally append a small Twilio media marker (byte counts) for traceability
+            appendCallLog(`TWILIO_MEDIA bytes=${rawMuLaw.length} pcmBytes=${pcm16Buffer.length} rms=${rms.toFixed(6)} rmsa=${rmsa.toFixed(6)}`);
 
             // Forward PCM16 audio to OpenAI Realtime WebSocket as base64-encoded messages
             try {
@@ -600,6 +768,14 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
         logEvent('twilio.stop', { sid: parsed.streamSid }, connId);
         // human-friendly log for checklist
         console.log(`[${nowTs()}] Stream ended`);
+        // Log stream stop and close per-call log
+        try {
+          appendCallLog(`TWILIO_STOP: ${JSON.stringify({ sid: parsed.streamSid })}`);
+          if (callLogStream) {
+            try { callLogStream.end(`${nowTs()} CALL_END: ${parsed.streamSid}\n`); } catch (e) {}
+            callLogStream = null;
+          }
+        } catch (e) { }
 
         // If there's pending audio that hasn't been committed yet, try to commit it now
         try {
@@ -628,15 +804,32 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
 
               const commitMsg = JSON.stringify({ type: 'input_audio_buffer.commit' });
               const createMsg = JSON.stringify({ type: 'response.create', response: { modalities: ['text'], instructions: 'transcribe the audio in Dutch' } });
-              try {
-                console.log(`[${nowTs()}] sending input_audio_buffer.commit (on stop)`);
-                if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(commitMsg);
-                console.log(`[${nowTs()}] sending response.create (transcribe) (on stop)`);
-                if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(createMsg);
-                logEvent('openai.commit.sent.on_stop', { bytes: combined.length, frames: pendingFrames.length }, connId);
-              } catch (e) {
-                logEvent('openai.commit.on_stop.error', { message: String(e && e.message ? e.message : e) }, connId);
-              }
+              // Send session.update before commit and delay slightly to reduce races
+              setTimeout(() => {
+                try {
+                  try {
+                    const sess = makeSessionUpdateMsg();
+                    if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
+                      aiSocket.send(sess);
+                      sessionUpdateSent = true;
+                      logEvent('openai.session.update.sent.pre_commit_on_stop', { note: 'sent before commit on stop' }, connId);
+                    } else {
+                      bufferStore({ ts: Date.now(), bytes: sess.length, isBinary: false, payload: sess });
+                      logEvent('openai.session.update.buffered.pre_commit_on_stop', { bytes: sess.length }, connId);
+                    }
+                  } catch (se) {
+                    logEvent('openai.session.update.pre_commit_on_stop.error', { message: String(se && se.message ? se.message : se) }, connId);
+                  }
+
+                  console.log(`[${nowTs()}] sending input_audio_buffer.commit (on stop)`);
+                  if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(commitMsg);
+                  console.log(`[${nowTs()}] sending response.create (transcribe) (on stop)`);
+                  if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(createMsg);
+                  logEvent('openai.commit.sent.on_stop', { bytes: combined.length, frames: pendingFrames.length }, connId);
+                } catch (e) {
+                  logEvent('openai.commit.on_stop.error', { message: String(e && e.message ? e.message : e) }, connId);
+                }
+              }, 300);
 
               pendingFrames.length = 0;
               pendingAudioSinceLastCommit = false;
@@ -657,6 +850,17 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
 
         } catch (e) {
           logEvent('checkpoint.error', { message: String(e && e.message ? e.message : e) }, connId);
+        }
+
+        // If we saw both user transcripts and assistant outputs during this call, mark checkpoint 3.0
+        try {
+          if (sawTranscriptOutput && sawAssistantOutput) {
+            const ck3 = `3.0 Completed — Twilio and OpenAI transcripts separated successfully - ${new Date().toISOString()}\n`;
+            try { fs.appendFileSync('/var/www/chatystream/.checkpoints', ck3); } catch (e) { /* best-effort */ }
+            logEvent('checkpoint.3.0.marked', { note: '3.0 Completed — Twilio and OpenAI transcripts separated successfully' }, connId);
+          }
+        } catch (e) {
+          logEvent('checkpoint.3.0.error', { message: String(e && e.message ? e.message : e) }, connId);
         }
 
         // clear any minimal state we kept
@@ -696,6 +900,13 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
     }
     clearInterval(heartbeatTimer);
     try { clearInterval(commitTimer); } catch (e) {}
+    // Ensure per-call log is closed on client close
+    try {
+      if (callLogStream) {
+        try { callLogStream.end(`${nowTs()} CALL_END: client_closed\n`); } catch (e) {}
+        callLogStream = null;
+      }
+    } catch (e) {}
   });
 
   clientWs.on('error', (err) => {
@@ -756,6 +967,30 @@ app.listen(PORT, () => {
   console.log('Chatty Stream Gateway active on :' + PORT);
   console.log('✅ TwiML endpoint active — Twilio can now stream live audio to the gateway.');
 });
+
+// Lightweight self-test: simulate one short .ulaw file to verify per-call logging works.
+// This runs on startup if the simulator and a test .ulaw file are present.
+function runSelfTest() {
+  try {
+    const simPath = '/var/www/chatystream/ws-client-twilio-sim.js';
+    const testFile = '/var/www/chatystream/greetingsgeneric.ulaw';
+    if (!fs.existsSync(simPath) || !fs.existsSync(testFile)) return;
+    const nodeBin = process.execPath || 'node';
+    const child = spawn(nodeBin, [simPath, testFile], { cwd: '/var/www/chatystream', stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.on('data', (d) => { try { console.log(`[selftest stdout] ${d.toString().trim()}`); } catch (e) {} });
+    child.stderr.on('data', (d) => { try { console.error(`[selftest stderr] ${d.toString().trim()}`); } catch (e) {} });
+    child.on('exit', (code) => {
+      logEvent('selftest.done', { code });
+      console.log('Call logging active');
+    });
+  } catch (e) {
+    // non-fatal
+    logEvent('selftest.error', { message: String(e && e.message ? e.message : e) });
+  }
+}
+
+// Run self-test shortly after startup to let server initialize
+setTimeout(runSelfTest, 1200);
 
 // graceful shutdown
 process.on('SIGINT', () => {

@@ -1,0 +1,8 @@
+2025-10-31T03:35:38.940Z CALL_START: conn2
+2025-10-31T03:35:38.940Z AUTOCREATE_CALLLOG: created fallback log for conn2
+2025-10-31T03:35:38.940Z [ASSISTANT]  helpen
+2025-10-31T03:35:38.942Z [ASSISTANT] ?
+2025-10-31T03:35:38.943Z [ASSISTANT] Hallo! Hoe kan ik je vandaag helpen?
+2025-10-31T03:35:38.945Z [ASSISTANT] Hallo! Hoe kan ik je vandaag helpen?
+2025-10-31T03:35:38.948Z [ASSISTANT] Hallo! Hoe kan ik je vandaag helpen?
+2025-10-31T03:35:39.872Z CALL_END: client_closed
