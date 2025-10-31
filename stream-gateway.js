@@ -13,6 +13,11 @@ const { app: wsApp } = expressWs(app);
 
 const PORT = 3002;
 
+// Work in 16 kHz for better ASR sensitivity
+const SAMPLE_RATE_HZ = 16000;
+// VAD-lite RMS threshold (very low for phone audio). Set at module scope so all connections use it.
+const RMS_THRESHOLD = 0.003;   // was 0.5 — far too strict for phone audio
+
 function nowTs() {
   return new Date().toISOString();
 }
@@ -70,7 +75,35 @@ function decodeMuLawBuffer(buf) {
   const out = Buffer.alloc(buf.length * 2);
   for (let i = 0; i < buf.length; i++) {
     const pcm = ulawToPcm16(buf[i]);
-    out.writeInt16LE(pcm, i * 2);
+    // Coerce to integer and clamp to signed 16-bit range to avoid RangeError
+    const v = Math.max(-32768, Math.min(32767, Math.round(Number(pcm) || 0)));
+    try {
+      out.writeInt16LE(v, i * 2);
+    } catch (err) {
+      // Defensive: log the bad value and continue (do not crash the whole process)
+      console.error('decodeMuLawBuffer: writeInt16LE failed', { index: i, pcm, coerced: v, err: String(err && err.message ? err.message : err) });
+      out.writeInt16LE(v & 0xffff, i * 2);
+    }
+  }
+  return out;
+}
+
+// Standard µ-law (u-law) 8-bit -> PCM16 converter (provided)
+function muLawToPCM16(buffer) {
+  // Use a standard ulaw -> PCM16 decoder per-sample and clamp to int16 range.
+  const out = Buffer.alloc(buffer.length * 2);
+  for (let i = 0; i < buffer.length; i++) {
+    // reuse the small, well-tested ulaw decoder above
+    let pcm = ulawToPcm16(buffer[i]);
+    // Ensure pcm is a finite number, coerce and clamp to signed 16-bit range
+    const v = Math.max(-32768, Math.min(32767, Math.round(Number(pcm) || 0)));
+    try {
+      out.writeInt16LE(v, i * 2);
+    } catch (err) {
+      // Defensive: log and write a safe value to avoid crashing entire gateway
+      console.error('muLawToPCM16: writeInt16LE failed', { index: i, pcm, coerced: v, err: String(err && err.message ? err.message : err) });
+      out.writeInt16LE(v & 0xffff, i * 2);
+    }
   }
   return out;
 }
@@ -172,6 +205,8 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
   let sawTranscriptOutput = false;
   // Accumulate speech frames (PCM16 Buffer objects) to batch before commit
   let pendingFrames = [];
+  // smoothed RMS value
+  let rmsa = 0;
 
   function scheduleAiConnect(delay = 0) {
     setTimeout(() => connectToAi(), delay);
@@ -225,6 +260,23 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
         }
       }
       if (flushedCount > 0) logEvent('buffer.flushed', { flushedCount, flushedBytes }, connId);
+      // Announce input audio format to the realtime session so server knows how to interpret appended audio
+      try {
+  // The realtime API expects a simple enum for input_audio_format (pcm16/g711_ulaw/g711_alaw).
+  // Provide 'pcm16' here and include sample_rate on individual append messages.
+  const sessionUpdate = JSON.stringify({ type: 'session.update', session: { input_audio_format: 'pcm16' } });
+        if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
+          aiSocket.send(sessionUpdate);
+          console.log(`[${nowTs()}] sent session.update (input_audio_format: pcm16)`);
+          logEvent('openai.session.update.sent', { input_audio_format: 'pcm16' }, connId);
+        } else {
+          // buffer this session update for flushing later
+          bufferStore({ ts: Date.now(), bytes: sessionUpdate.length, isBinary: false, payload: sessionUpdate });
+          logEvent('openai.session.update.buffered', { bytes: sessionUpdate.length }, connId);
+        }
+      } catch (e) {
+        logEvent('openai.session.update.error', { message: String(e && e.message ? e.message : e) }, connId);
+      }
     });
 
     // Unexpected-response gives access to HTTP status codes (e.g., 401/403)
@@ -273,15 +325,17 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
 
       // Print partial transcript when OpenAI returns response.output_text.delta
       try {
-        if (parsedAi && parsedAi.type === 'response.output_text.delta') {
+        if (parsedAi && (parsedAi.type === 'response.output_text.delta' || parsedAi.type === 'response.text.delta')) {
           const deltaText = parsedAi.delta && (parsedAi.delta.content || parsedAi.delta) ? (parsedAi.delta.content || parsedAi.delta) : (parsedAi.text || '');
           if (deltaText) {
-            // Explicit transcript console line as requested
+            // Print transcript with the exact requested format
             try {
-              const maybeDelta = typeof parsedAi.delta !== 'undefined' ? parsedAi.delta : parsedAi.text;
-              console.log(`[${nowTs()}] OpenAI transcript: ${JSON.stringify(maybeDelta)}`);
+              // trace enter for debugging ReferenceError issues
+              try { console.log(`[${nowTs()}] media.process.start decodedBytes=${Buffer.from(payloadB64, 'base64').length}`); } catch (err) {}
+              console.log(`[${nowTs()}] Transcript: ${String(deltaText)}`);
+              try { console.log(`[${nowTs()}] media.process.ok`); } catch (err) {}
             } catch (e) {
-              console.log(`[${nowTs()}] OpenAI transcript: ${deltaText}`);
+              console.log(`[${nowTs()}] Transcript: ${String(deltaText)}`);
             }
             logEvent('openai.transcript.delta', { text: deltaText }, connId);
             sawTranscriptOutput = true;
@@ -291,7 +345,7 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
         // Backwards/compat: older events called transcript.delta
         if (parsedAi && parsedAi.type === 'transcript.delta') {
           const text = parsedAi.text || (parsedAi.delta && parsedAi.delta.text) || '';
-          console.log(`[${nowTs()}] OpenAI transcript: ${JSON.stringify(parsedAi.delta || text)}`);
+          console.log(`[${nowTs()}] Transcript: ${String(text)}`);
           logEvent('openai.transcript.delta', { text }, connId);
           sawTranscriptOutput = true;
         }
@@ -348,35 +402,55 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
 
   // Periodic committer: every ~1s, if we've appended any audio since last commit, commit and request a response.
   const COMMIT_INTERVAL_MS = 1000;
+  // Work in SAMPLE_RATE_HZ and 16-bit mono (2 bytes/sample). Require ~100ms of audio minimum.
+  const MIN_COMMIT_BYTES = Math.floor(SAMPLE_RATE_HZ * 2 * 0.10); // 100 ms
+  // RMS gating parameters
+  // RMS_THRESHOLD is defined at module scope to make it easy to tune globally for phone audio.
+  const RMS_ALPHA = 0.3; // smoothing factor for RMS
   const commitTimer = setInterval(() => {
     try {
       // If we have queued frames, batch them into a single append before committing
       if (pendingFrames.length > 0) {
         console.log(`[${nowTs()}] batching ${pendingFrames.length} frames before commit`);
         const combined = Buffer.concat(pendingFrames);
-        const audioB64 = combined.toString('base64');
-        const appendMsg = JSON.stringify({ type: 'input_audio_buffer.append', audio: audioB64 });
+        // If combined audio is too small, skip committing now and wait for more audio
+        if (combined.length < MIN_COMMIT_BYTES) {
+          console.log(`[${nowTs()}] skipping commit — combined ${combined.length} bytes < ${MIN_COMMIT_BYTES} bytes (waiting for more audio)`);
+          logEvent('openai.commit.skipped_too_small', { bytes: combined.length, min: MIN_COMMIT_BYTES }, connId);
+          // Do not clear pendingFrames; wait for next interval or more incoming audio
+          return;
+        }
+
+  const audioB64 = combined.toString('base64');
+  // Do not send unsupported 'sample_rate' parameter — the realtime API rejects unknown parameters.
+  const appendMsg = JSON.stringify({ type: 'input_audio_buffer.append', audio: audioB64 });
 
         if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
           aiSocket.send(appendMsg);
-          console.log(`[${nowTs()}] sent combined input_audio_buffer.append (${pendingFrames.length} frames, ${combined.length} bytes)`);
-          logEvent('openai.audio.sent', { combinedFrames: pendingFrames.length, bytes: combined.length }, connId);
+          console.log(`[${nowTs()}] input_audio_buffer.append sent (${pendingFrames.length} frames, ${combined.length} bytes)`);
+          logEvent('openai.audio.sent', { frames: pendingFrames.length, bytes: combined.length }, connId);
         } else {
           // Buffer the combined append for flushing later
           bufferStore({ ts: Date.now(), bytes: combined.length, isBinary: false, payload: appendMsg });
-          logEvent('openai.audio.buffered_combined', { combinedFrames: pendingFrames.length, bytes: combined.length }, connId);
+          logEvent('openai.audio.buffered_combined', { frames: pendingFrames.length, bytes: combined.length }, connId);
         }
 
-        // After sending/appending, commit and create a response
-  const commitMsg = JSON.stringify({ type: 'input_audio_buffer.commit' });
-  const createMsg = JSON.stringify({ type: 'response.create', response: { modalities: ['text'], instructions: 'transcribe the audio in Dutch' } });
-        console.log(`[${nowTs()}] sending input_audio_buffer.commit`);
-        if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(commitMsg);
-        console.log(`[${nowTs()}] sending response.create (transcribe)`);
-        if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(createMsg);
-        logEvent('openai.commit.sent', { commitBytes: combined.length, frames: pendingFrames.length }, connId);
+        // After sending/appending, wait a short time before committing to avoid race conditions
+        const commitMsg = JSON.stringify({ type: 'input_audio_buffer.commit' });
+        const createMsg = JSON.stringify({ type: 'response.create', response: { modalities: ['text'], instructions: 'transcribe the audio in Dutch' } });
+        setTimeout(() => {
+          try {
+            console.log(`[${nowTs()}] sending input_audio_buffer.commit`);
+            if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(commitMsg);
+            console.log(`[${nowTs()}] sending response.create (transcribe)`);
+            if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(createMsg);
+            logEvent('openai.commit.sent', { bytes: combined.length }, connId);
+          } catch (e) {
+            logEvent('openai.commit.error', { message: String(e && e.message ? e.message : e) }, connId);
+          }
+        }, 75);
 
-        // clear pending frames
+        // clear pending frames only after scheduling commit
         pendingFrames.length = 0;
         pendingAudioSinceLastCommit = false;
       }
@@ -469,23 +543,16 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
       } else if (parsed.event === 'media') {
         // payload is base64 in parsed.media.payload
         const payloadB64 = parsed.media && parsed.media.payload;
-        if (payloadB64) {
+            if (payloadB64) {
           try {
-            // Decode base64 first
-            const raw = Buffer.from(payloadB64, 'base64');
+            // Decode base64 into raw bytes from Twilio. Twilio often sends µ-law (8-bit, 8kHz).
+            // Use muLawToPCM16 to convert to PCM16LE before processing so OpenAI receives proper samples.
+            const rawMuLaw = Buffer.from(payloadB64, 'base64');
+            const pcm16Buffer8k = muLawToPCM16(rawMuLaw);
+            // Upsample to SAMPLE_RATE_HZ (8k -> 16k)
+            const pcm16Buffer = upsample8kTo16k(pcm16Buffer8k);
 
-            // Twilio may send either raw PCM16LE (audio/pcm) or mu-law 8-bit samples.
-            // Prefer PCM16LE when payload length is even and looks like int16 samples.
-            let pcm16Buffer = null;
-            if (raw.length % 2 === 0) {
-              // Treat as PCM16LE
-              pcm16Buffer = raw;
-            } else {
-              // Fallback to mu-law decode for odd-length buffers
-              pcm16Buffer = decodeMuLawBuffer(raw);
-            }
-
-            // Compute RMS over int16 samples
+            // Compute RMS over int16 samples (use upsampled buffer)
             const sampleCount = Math.floor(pcm16Buffer.length / 2);
             let sumSq = 0;
             for (let i = 0; i < sampleCount; i++) {
@@ -495,29 +562,38 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
             const meanSq = sampleCount > 0 ? (sumSq / sampleCount) : 0;
             const rms = Math.sqrt(meanSq) / 32768; // normalize to [0,1]
 
+            // Apply simple smoothing to RMS
+            rmsa = RMS_ALPHA * rms + (1 - RMS_ALPHA) * rmsa;
+
+            // Temporary debug: show raw rms, smoothed rmsa, and whether the frame would be queued.
+            console.log('rms/rmsa:', rms.toFixed(4), rmsa.toFixed(4), 'queued?:', rmsa > RMS_THRESHOLD);
+
             // Log in a human-friendly single-line format for easy grepping during tests
             console.log(`[${nowTs()}] frames: ${pcm16Buffer.length} bytes, rms: ${rms.toFixed(4)}`);
 
             // Also emit structured event for diagnostics
-            logEvent('twilio.media', { bytes: raw.length, pcmBytes: pcm16Buffer.length, rms }, connId);
+            logEvent('twilio.media', { bytes: rawMuLaw.length, pcmBytes: pcm16Buffer.length, rms, rmsa }, connId);
 
             // Forward PCM16 audio to OpenAI Realtime WebSocket as base64-encoded messages
             try {
-              // Only queue audio frames when RMS indicates speech (> 0.1). Otherwise skip silence.
-              if (rms > 0.1) {
+              // Only queue audio frames when smoothed RMS indicates speech (rmsa > RMS_THRESHOLD). Otherwise skip silence.
+              if (rmsa > RMS_THRESHOLD) {
                 pendingAudioSinceLastCommit = true;
                 // store the PCM16 Buffer locally for batching
                 pendingFrames.push(pcm16Buffer);
-                logEvent('openai.audio.queued', { bytes: pcm16Buffer.length, rms, pendingFrames: pendingFrames.length }, connId);
+                const queuedBytesTotal = pendingFrames.reduce((s, b) => s + (b.length || 0), 0);
+                logEvent('openai.audio.queued', { bytes: pcm16Buffer.length, rms, rmsa, pendingFrames: pendingFrames.length, queuedBytesTotal }, connId);
               } else {
                 // silence — skip queuing
-                logEvent('openai.audio.skip_silence', { bytes: pcm16Buffer.length, rms }, connId);
+                logEvent('openai.audio.skip_silence', { bytes: pcm16Buffer.length, rms, rmsa }, connId);
               }
             } catch (e) {
               logEvent('openai.forward.error', { message: String(e && e.message ? e.message : e) }, connId);
             }
           } catch (e) {
-            logEvent('twilio.error', { message: String(e && e.message ? e.message : e) }, connId);
+            // include stack where possible to help trace ReferenceError like "raw is not defined"
+            try { console.error('twilio.media.catch:', e); } catch (err) {}
+            logEvent('twilio.error', { message: String(e && e.message ? e.message : e), stack: (e && e.stack) ? e.stack : undefined, caughtType: typeof e }, connId);
           }
         }
       } else if (parsed.event === 'stop') {
@@ -530,32 +606,41 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
           if (pendingFrames.length > 0) {
             console.log(`[${nowTs()}] batching ${pendingFrames.length} frames before commit (on stop)`);
             const combined = Buffer.concat(pendingFrames);
-            const audioB64 = combined.toString('base64');
-            const appendMsg = JSON.stringify({ type: 'input_audio_buffer.append', audio: audioB64 });
-
-            if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
-              aiSocket.send(appendMsg);
-              console.log(`[${nowTs()}] sent combined input_audio_buffer.append (${pendingFrames.length} frames, ${combined.length} bytes) (on stop)`);
-              logEvent('openai.audio.sent', { combinedFrames: pendingFrames.length, bytes: combined.length }, connId);
+            // Enforce minimum commit size on stop as well
+            if (combined.length < MIN_COMMIT_BYTES) {
+              console.log(`[${nowTs()}] skipping commit on stop — combined ${combined.length} bytes < ${MIN_COMMIT_BYTES} bytes`);
+              logEvent('openai.commit.skipped_too_small.on_stop', { combinedBytes: combined.length, minRequired: MIN_COMMIT_BYTES }, connId);
+              // Do not clear pendingFrames here so operator can inspect logs; there is no more incoming audio.
             } else {
-              bufferStore({ ts: Date.now(), bytes: combined.length, isBinary: false, payload: appendMsg });
-              logEvent('openai.audio.buffered_combined', { combinedFrames: pendingFrames.length, bytes: combined.length }, connId);
-            }
 
-            const commitMsg = JSON.stringify({ type: 'input_audio_buffer.commit' });
-            const createMsg = JSON.stringify({ type: 'response.create', response: { modalities: ['text'], instructions: 'transcribe the audio in Dutch' } });
-            try {
-              console.log(`[${nowTs()}] sending input_audio_buffer.commit (on stop)`);
-              if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(commitMsg);
-              console.log(`[${nowTs()}] sending response.create (transcribe) (on stop)`);
-              if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(createMsg);
-              logEvent('openai.commit.sent.on_stop', { bytes: combined.length, frames: pendingFrames.length }, connId);
-            } catch (e) {
-              logEvent('openai.commit.on_stop.error', { message: String(e && e.message ? e.message : e) }, connId);
-            }
+              const audioB64 = combined.toString('base64');
+              // Do not include unsupported 'sample_rate' field — the realtime API rejects unknown parameters.
+              const appendMsg = JSON.stringify({ type: 'input_audio_buffer.append', audio: audioB64 });
 
-            pendingFrames.length = 0;
-            pendingAudioSinceLastCommit = false;
+              if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
+                aiSocket.send(appendMsg);
+                console.log(`[${nowTs()}] sent combined input_audio_buffer.append (${pendingFrames.length} frames, ${combined.length} bytes) (on stop)`);
+                logEvent('openai.audio.sent', { combinedFrames: pendingFrames.length, bytes: combined.length }, connId);
+              } else {
+                bufferStore({ ts: Date.now(), bytes: combined.length, isBinary: false, payload: appendMsg });
+                logEvent('openai.audio.buffered_combined', { combinedFrames: pendingFrames.length, bytes: combined.length }, connId);
+              }
+
+              const commitMsg = JSON.stringify({ type: 'input_audio_buffer.commit' });
+              const createMsg = JSON.stringify({ type: 'response.create', response: { modalities: ['text'], instructions: 'transcribe the audio in Dutch' } });
+              try {
+                console.log(`[${nowTs()}] sending input_audio_buffer.commit (on stop)`);
+                if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(commitMsg);
+                console.log(`[${nowTs()}] sending response.create (transcribe) (on stop)`);
+                if (aiSocket && aiSocket.readyState === WebSocket.OPEN) aiSocket.send(createMsg);
+                logEvent('openai.commit.sent.on_stop', { bytes: combined.length, frames: pendingFrames.length }, connId);
+              } catch (e) {
+                logEvent('openai.commit.on_stop.error', { message: String(e && e.message ? e.message : e) }, connId);
+              }
+
+              pendingFrames.length = 0;
+              pendingAudioSinceLastCommit = false;
+            }
           }
         } catch (e) {
           logEvent('openai.commit.on_stop.error', { message: String(e && e.message ? e.message : e) }, connId);
@@ -564,10 +649,11 @@ wsApp.ws('/stream-gateway', (clientWs, req) => {
         // Mark checkpoint if we received transcript output
         try {
           if (sawTranscriptOutput) {
-            const ck = `2.2 Completed — Audio Forwarded and Transcribed - ${new Date().toISOString()}\n`;
-            try { fs.appendFileSync('/var/www/chatystream/.checkpoints', ck); } catch (e) { /* best-effort */ }
-            logEvent('checkpoint.2.2.marked', { note: '2.2 Completed — Audio Forwarded and Transcribed' }, connId);
-          }
+              // Mark the higher-level checkpoint 2.9 when transcript output was observed for this session
+              const ck = `2.9 Completed — Audio Transcribed Successfully - ${new Date().toISOString()}\n`;
+              try { fs.appendFileSync('/var/www/chatystream/.checkpoints', ck); } catch (e) { /* best-effort */ }
+              logEvent('checkpoint.2.9.marked', { note: '2.9 Completed — Audio Transcribed Successfully' }, connId);
+            }
 
         } catch (e) {
           logEvent('checkpoint.error', { message: String(e && e.message ? e.message : e) }, connId);
